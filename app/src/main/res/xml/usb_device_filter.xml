@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Ingenico USB Vendor IDs -->
+    <usb-device vendor-id="6552" />  <!-- 0x1998 Ingenico -->
+    <usb-device vendor-id="7636" />  <!-- 0x1DD4 Ingenico (alternate) -->
+</resources>

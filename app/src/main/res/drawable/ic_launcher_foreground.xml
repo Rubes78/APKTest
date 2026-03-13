@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Simple terminal/payment icon -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M34,30h40c2.2,0 4,1.8 4,4v40c0,2.2 -1.8,4 -4,4h-40c-2.2,0 -4,-1.8 -4,-4v-40c0,-2.2 1.8,-4 4,-4zM36,36h36v12h-36zM36,52h8v8h-8zM48,52h8v8h-8zM60,52h12v8h-12z" />
+</vector>
