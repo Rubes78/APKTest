@@ -1,12 +1,13 @@
 package com.worldpay.usitester;
 
 import android.app.AlertDialog;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
-import android.hardware.usb.UsbDevice;
-import android.hardware.usb.UsbManager;
+import android.content.ServiceConnection;
+import android.net.VpnService;
 import android.os.Bundle;
-import android.provider.Settings;
+import android.os.IBinder;
 import android.text.InputType;
 import android.view.View;
 import android.widget.EditText;
@@ -24,16 +25,18 @@ import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.text.SimpleDateFormat;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
-import java.util.HashMap;
-import java.util.List;
 import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity implements USIClient.Listener {
 
-    private USIClient client;
+    private static final int VPN_REQUEST_CODE = 100;
+
+    private USIClient usiClient;
+    private UsbEthernetManager usbManager;
+    private PCLBridgeService bridgeService;
+    private boolean bridgeBound = false;
 
     private TextInputEditText etHost, etPort;
     private MaterialButton btnConnect, btnDisconnect;
@@ -46,25 +49,63 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
     private long lastSendTime;
     private final SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
 
+    // Bridge state
+    private boolean usbReady = false;
+    private boolean vpnReady = false;
+
+    private final ServiceConnection bridgeConnection = new ServiceConnection() {
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder service) {
+            PCLBridgeService.LocalBinder binder = (PCLBridgeService.LocalBinder) service;
+            bridgeService = binder.getService();
+            bridgeBound = true;
+
+            bridgeService.setLogListener(msg -> log("BRIDGE", msg));
+            bridgeService.setUsbManager(usbManager);
+
+            log("SYS", "Bridge service connected");
+
+            // If USB is already ready, start the bridge
+            if (usbReady) {
+                startVpnBridge();
+            }
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            bridgeService = null;
+            bridgeBound = false;
+        }
+    };
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        client = new USIClient();
-        client.setListener(this);
+        usiClient = new USIClient();
+        usiClient.setListener(this);
 
         bindViews();
         setupClickListeners();
 
-        // Auto-run diagnostics on launch
-        runDiagnostics();
-    }
+        // Default to the PCL bridge gateway IP
+        etHost.setText(PCLBridgeService.TERMINAL_IP);
 
-    @Override
-    protected void onResume() {
-        super.onResume();
-        // Re-scan when returning from tethering settings
+        log("SYS", "========================================");
+        log("SYS", "  USI Terminal Tester + PCL Bridge");
+        log("SYS", "========================================");
+        log("SYS", "");
+        log("SYS", "This app acts as the PCL bridge between");
+        log("SYS", "the Lane 7000 and the internet.");
+        log("SYS", "");
+        log("SYS", "1. USB link to terminal (Ethernet over USB)");
+        log("SYS", "2. Internet bridge (terminal → tablet WiFi)");
+        log("SYS", "3. WebSocket for USI commands");
+        log("SYS", "");
+
+        // Start USB detection
+        initUsb();
     }
 
     private void bindViews() {
@@ -86,200 +127,128 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
         scrollLog = findViewById(R.id.scrollLog);
     }
 
-    /**
-     * Full diagnostics: network interfaces, USB devices, tethering state,
-     * and terminal scan on USB subnets.
-     */
-    private void runDiagnostics() {
-        log("DIAG", "========================================");
-        log("DIAG", "  PCL Bridge Diagnostics");
-        log("DIAG", "========================================");
+    private void initUsb() {
+        log("USB", "Scanning for Ingenico terminal...");
+        setStatus("Scanning USB...", R.drawable.status_dot_yellow);
 
-        // ── Step 1: Network interfaces ──
-        log("DIAG", "");
-        log("DIAG", "[1] Network Interfaces:");
-        boolean foundUsbEth = false;
-        String usbGatewayIp = null;
-        String usbSubnet = null;
-
-        try {
-            for (NetworkInterface iface : Collections.list(NetworkInterface.getNetworkInterfaces())) {
-                if (!iface.isUp()) continue;
-
-                String name = iface.getName().toLowerCase();
-                StringBuilder sb = new StringBuilder();
-                sb.append("  ").append(iface.getName());
-
-                String ipv4 = null;
-                for (InetAddress addr : Collections.list(iface.getInetAddresses())) {
-                    if (addr instanceof Inet4Address) {
-                        ipv4 = addr.getHostAddress();
-                        sb.append(" → ").append(ipv4);
-                    }
-                }
-
-                // Detect USB tethering interfaces
-                // Android USB tethering: rndis0, usb0, or sometimes eth1
-                // Common tethering subnets: 192.168.42.x, 192.168.48.x
-                boolean isUsbIface = name.contains("usb") || name.contains("rndis")
-                        || (ipv4 != null && (ipv4.startsWith("192.168.42.") || ipv4.startsWith("192.168.48.")));
-
-                if (isUsbIface) {
-                    sb.append(" [USB TETHERING]");
-                    foundUsbEth = true;
-                    if (ipv4 != null) {
-                        usbGatewayIp = ipv4;
-                        // Derive subnet (e.g., 192.168.42)
-                        int lastDot = ipv4.lastIndexOf('.');
-                        usbSubnet = ipv4.substring(0, lastDot);
-                    }
-                } else if (name.contains("wlan") || name.contains("wifi")) {
-                    sb.append(" [WIFI]");
-                } else if (name.equals("lo")) {
-                    continue; // skip loopback
-                }
-
-                log("DIAG", sb.toString());
+        usbManager = new UsbEthernetManager(this);
+        usbManager.setListener(new UsbEthernetManager.Listener() {
+            @Override
+            public void onLog(String message) {
+                log("USB", message);
             }
-        } catch (Exception e) {
-            log("DIAG", "  Error: " + e.getMessage());
-        }
 
-        // ── Step 2: USB devices ──
-        log("DIAG", "");
-        log("DIAG", "[2] USB Devices:");
-        boolean foundIngenico = false;
-        try {
-            UsbManager usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
-            HashMap<String, UsbDevice> devices = usbManager.getDeviceList();
-            if (devices.isEmpty()) {
-                log("DIAG", "  (none)");
+            @Override
+            public void onUsbReady(String terminalInfo) {
+                log("USB", "Terminal ready: " + terminalInfo);
+                usbReady = true;
+                setStatus("USB ready, starting bridge...", R.drawable.status_dot_yellow);
+
+                // Start the VPN bridge service
+                bindBridgeService();
+            }
+
+            @Override
+            public void onUsbError(String error) {
+                log("USB", "ERROR: " + error);
+                setStatus("USB Error", R.drawable.status_dot_red);
+            }
+
+            @Override
+            public void onUsbDisconnected() {
+                log("USB", "Terminal disconnected");
+                usbReady = false;
+                vpnReady = false;
+                setStatus("Disconnected", R.drawable.status_dot_red);
+                setCommandsEnabled(false);
+                if (usiClient.isConnected()) {
+                    usiClient.disconnect();
+                }
+            }
+
+            @Override
+            public void onEthernetFrame(byte[] frame, int length) {
+                // Forward frames from terminal to the bridge
+                if (bridgeService != null && bridgeService.isRunning()) {
+                    bridgeService.onTerminalFrame(frame, length);
+                }
+            }
+        });
+
+        usbManager.start();
+    }
+
+    private void bindBridgeService() {
+        Intent intent = new Intent(this, PCLBridgeService.class);
+        startService(intent);
+        bindService(intent, bridgeConnection, Context.BIND_AUTO_CREATE);
+    }
+
+    private void startVpnBridge() {
+        // Check if VPN permission is granted
+        Intent vpnIntent = VpnService.prepare(this);
+        if (vpnIntent != null) {
+            log("SYS", "VPN permission needed — approve the dialog");
+            startActivityForResult(vpnIntent, VPN_REQUEST_CODE);
+        } else {
+            // Already have VPN permission
+            activateBridge();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == VPN_REQUEST_CODE) {
+            if (resultCode == RESULT_OK) {
+                log("SYS", "VPN permission granted");
+                activateBridge();
             } else {
-                for (UsbDevice device : devices.values()) {
-                    String info = String.format(Locale.US,
-                            "  VID:%04X PID:%04X %s %s (class:%d)",
-                            device.getVendorId(), device.getProductId(),
-                            device.getManufacturerName() != null ? device.getManufacturerName() : "",
-                            device.getProductName() != null ? device.getProductName() : "",
-                            device.getDeviceClass());
-                    log("DIAG", info);
-
-                    int vid = device.getVendorId();
-                    if (vid == 0x1998 || vid == 0x1DD4 || vid == 0x0B00) {
-                        log("DIAG", "    ^ INGENICO TERMINAL");
-                        foundIngenico = true;
-                    }
-                }
+                log("SYS", "VPN permission denied — bridge cannot function");
+                setStatus("VPN denied", R.drawable.status_dot_red);
             }
-        } catch (Exception e) {
-            log("DIAG", "  Error: " + e.getMessage());
         }
+    }
 
-        // ── Step 3: Status assessment ──
-        log("DIAG", "");
-        log("DIAG", "[3] Status:");
-
-        if (!foundIngenico) {
-            log("DIAG", "  ✗ No Ingenico USB device detected.");
-            log("DIAG", "    → Check USB cable connection.");
-            log("DIAG", "    → Tablet must be USB HOST (use OTG adapter if needed).");
-            log("DIAG", "");
+    private void activateBridge() {
+        if (bridgeService == null) {
+            log("SYS", "Waiting for bridge service...");
             return;
         }
 
-        log("DIAG", "  ✓ Ingenico terminal detected on USB.");
+        if (bridgeService.startBridge()) {
+            vpnReady = true;
+            setStatus("Bridge active — connecting...", R.drawable.status_dot_yellow);
+            log("SYS", "");
+            log("SYS", "PCL bridge is active!");
+            log("SYS", "Terminal should get IP: " + PCLBridgeService.TERMINAL_IP);
+            log("SYS", "Internet is bridged through tablet WiFi.");
+            log("SYS", "");
 
-        if (!foundUsbEth) {
-            log("DIAG", "  ✗ No USB Ethernet/tethering interface active.");
-            log("DIAG", "");
-            log("DIAG", "  ══════════════════════════════════════");
-            log("DIAG", "  ACTION REQUIRED: Enable USB Tethering");
-            log("DIAG", "  ══════════════════════════════════════");
-            log("DIAG", "  The Lane 7000 needs the tablet to share");
-            log("DIAG", "  its internet via USB. This creates the");
-            log("DIAG", "  PCL bridge network link.");
-            log("DIAG", "");
-            log("DIAG", "  Go to: Settings → Network/Connections");
-            log("DIAG", "       → Hotspot & Tethering");
-            log("DIAG", "       → USB Tethering → ON");
-            log("DIAG", "");
-            log("DIAG", "  Then tap Clear to re-scan.");
-            log("DIAG", "");
+            // Auto-connect WebSocket after a short delay
+            // (give terminal time to come up on the network)
+            scrollLog.postDelayed(this::autoConnectWebSocket, 3000);
+        } else {
+            setStatus("Bridge failed", R.drawable.status_dot_red);
+        }
+    }
 
-            // Offer to open tethering settings
-            new AlertDialog.Builder(this)
-                    .setTitle("Enable USB Tethering")
-                    .setMessage("Ingenico terminal detected but USB tethering is off.\n\n"
-                            + "USB tethering creates the PCL bridge — it shares the tablet's "
-                            + "internet with the terminal via USB.\n\n"
-                            + "Open tethering settings now?")
-                    .setPositiveButton("Open Settings", (d, w) -> {
-                        try {
-                            // Try tethering settings directly
-                            Intent intent = new Intent(Settings.ACTION_WIRELESS_SETTINGS);
-                            startActivity(intent);
-                        } catch (Exception e) {
-                            // Fallback to general settings
-                            startActivity(new Intent(Settings.ACTION_SETTINGS));
-                        }
-                    })
-                    .setNegativeButton("Later", null)
-                    .show();
+    private void autoConnectWebSocket() {
+        if (!vpnReady || !usbReady) return;
+
+        String host = etHost.getText().toString().trim();
+        String portStr = etPort.getText().toString().trim();
+        int port;
+        try {
+            port = Integer.parseInt(portStr);
+        } catch (NumberFormatException e) {
             return;
         }
 
-        log("DIAG", "  ✓ USB tethering active: " + usbGatewayIp);
-        log("DIAG", "    Tablet is gateway on " + usbSubnet + ".x subnet.");
-
-        // ── Step 4: Scan USB subnet for terminal's WebSocket port ──
-        log("DIAG", "");
-        log("DIAG", "[4] Scanning " + usbSubnet + ".0/24 for port 50000...");
-
-        final String scanSubnet = usbSubnet;
-        new Thread(() -> {
-            String foundIp = null;
-
-            // Also try the standard PCL bridge IPs
-            List<String> scanIps = new ArrayList<>();
-            // Common terminal IPs on tethering subnets
-            for (int i = 1; i <= 254; i++) {
-                scanIps.add(scanSubnet + "." + i);
-            }
-            // Also try standard PCL IPs in case
-            scanIps.add("172.16.0.1");
-            scanIps.add("172.16.0.2");
-
-            for (String ip : scanIps) {
-                try {
-                    java.net.Socket s = new java.net.Socket();
-                    s.connect(new java.net.InetSocketAddress(ip, 50000), 300);
-                    s.close();
-                    foundIp = ip;
-                    break;
-                } catch (Exception ignored) {}
-            }
-
-            final String terminalIp = foundIp;
-            runOnUiThread(() -> {
-                if (terminalIp != null) {
-                    log("DIAG", "  ✓ TERMINAL FOUND at " + terminalIp + ":50000");
-                    log("DIAG", "");
-                    log("DIAG", "  Ready to connect! Tap Connect button.");
-                    etHost.setText(terminalIp);
-                    setStatus("Terminal found", R.drawable.status_dot_yellow);
-                } else {
-                    log("DIAG", "  ✗ No terminal responding on port 50000.");
-                    log("DIAG", "    The terminal may need a moment after");
-                    log("DIAG", "    tethering is enabled. Tap Clear to retry.");
-                    log("DIAG", "");
-                    log("DIAG", "  If this persists, verify in the terminal's");
-                    log("DIAG", "  iConnect-Ws config that:");
-                    log("DIAG", "    mode: 0 (server)");
-                    log("DIAG", "    usb_pcl: 1");
-                    log("DIAG", "    ws_server port: 50000");
-                }
-            });
-        }).start();
+        log("SYS", "Auto-connecting WebSocket to " + host + ":" + port + "...");
+        setStatus("Connecting WebSocket...", R.drawable.status_dot_yellow);
+        usiClient.connect(host, port);
+        btnConnect.setEnabled(false);
     }
 
     private void setupClickListeners() {
@@ -300,12 +269,12 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
 
             setStatus("Connecting...", R.drawable.status_dot_yellow);
             log("SYS", "Connecting to ws://" + host + ":" + port + " ...");
-            client.connect(host, port);
+            usiClient.connect(host, port);
             btnConnect.setEnabled(false);
         });
 
         btnDisconnect.setOnClickListener(v -> {
-            client.disconnect();
+            usiClient.disconnect();
             setStatus("Disconnected", R.drawable.status_dot_red);
             setCommandsEnabled(false);
             btnConnect.setEnabled(true);
@@ -316,7 +285,7 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
         btnSoftReset.setOnClickListener(v -> {
             log("CMD", "Sending soft reset...");
             lastSendTime = System.currentTimeMillis();
-            client.sendSoftReset();
+            usiClient.sendSoftReset();
         });
 
         btnHardReset.setOnClickListener(v -> {
@@ -326,7 +295,7 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
                     .setPositiveButton("Reset", (d, w) -> {
                         log("CMD", "Sending hard reset...");
                         lastSendTime = System.currentTimeMillis();
-                        client.sendHardReset();
+                        usiClient.sendHardReset();
                     })
                     .setNegativeButton("Cancel", null)
                     .show();
@@ -335,7 +304,7 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
         btnDeviceInfo.setOnClickListener(v -> {
             log("CMD", "Requesting device info...");
             lastSendTime = System.currentTimeMillis();
-            client.sendDeviceInfo();
+            usiClient.sendDeviceInfo();
         });
 
         btnTestSale.setOnClickListener(v -> {
@@ -345,7 +314,7 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
                     .setPositiveButton("Send", (d, w) -> {
                         log("CMD", "Sending $0.01 test sale...");
                         lastSendTime = System.currentTimeMillis();
-                        client.sendSale(1);  // 1 cent
+                        usiClient.sendSale(1);
                     })
                     .setNegativeButton("Cancel", null)
                     .show();
@@ -368,7 +337,7 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
                             }
                             log("CMD", "Sending sale for $" + String.format(Locale.US, "%.2f", dollars) + " (" + cents + " cents)...");
                             lastSendTime = System.currentTimeMillis();
-                            client.sendSale(cents);
+                            usiClient.sendSale(cents);
                         } catch (NumberFormatException e) {
                             log("ERROR", "Invalid amount");
                         }
@@ -391,7 +360,7 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
                         if (json.isEmpty()) return;
                         log("CMD", "Sending raw JSON...");
                         lastSendTime = System.currentTimeMillis();
-                        client.sendRaw(json);
+                        usiClient.sendRaw(json);
                     })
                     .setNegativeButton("Cancel", null)
                     .show();
@@ -399,11 +368,14 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
 
         btnClearLog.setOnClickListener(v -> {
             tvLog.setText("");
-            runDiagnostics();
+            log("SYS", "Log cleared. Current state:");
+            log("SYS", "  USB: " + (usbReady ? "ready" : "not connected"));
+            log("SYS", "  Bridge: " + (vpnReady ? "active" : "inactive"));
+            log("SYS", "  WebSocket: " + (usiClient.isConnected() ? "connected" : "disconnected"));
         });
     }
 
-    // ── USIClient.Listener callbacks (already on main thread) ──
+    // ── USIClient.Listener callbacks ──
 
     @Override
     public void onConnected() {
@@ -411,16 +383,18 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
         setCommandsEnabled(true);
         btnConnect.setEnabled(false);
         btnDisconnect.setEnabled(true);
-        log("SYS", "WebSocket connected to terminal");
+        log("SYS", "WebSocket connected to terminal!");
+        log("SYS", "Ready to send USI commands.");
     }
 
     @Override
     public void onDisconnected(String reason) {
-        setStatus("Disconnected", R.drawable.status_dot_red);
+        setStatus(vpnReady ? "Bridge active" : "Disconnected",
+                vpnReady ? R.drawable.status_dot_yellow : R.drawable.status_dot_red);
         setCommandsEnabled(false);
         btnConnect.setEnabled(true);
         btnDisconnect.setEnabled(false);
-        log("SYS", "Disconnected: " + reason);
+        log("SYS", "WebSocket disconnected: " + reason);
     }
 
     @Override
@@ -483,7 +457,7 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
                     String type = res.has("type") ? res.get("type").getAsString() : "";
                     if ("transaction_completed".equals(type) && !flowId.isEmpty()) {
                         log("SYS", "Auto-sending event_ack for flow " + flowId);
-                        client.sendEventAck(endpoint, flowId);
+                        usiClient.sendEventAck(endpoint, flowId);
                     }
                 }
             }
@@ -513,7 +487,12 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
 
     @Override
     protected void onDestroy() {
-        client.shutdown();
+        usiClient.shutdown();
+        if (usbManager != null) usbManager.stop();
+        if (bridgeBound) {
+            if (bridgeService != null) bridgeService.stopBridge();
+            unbindService(bridgeConnection);
+        }
         super.onDestroy();
     }
 }
