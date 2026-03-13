@@ -1,6 +1,9 @@
 package com.worldpay.usitester;
 
 import android.app.AlertDialog;
+import android.content.Context;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbManager;
 import android.os.Bundle;
 import android.text.InputType;
 import android.view.View;
@@ -15,8 +18,13 @@ import com.google.android.material.textfield.TextInputEditText;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.text.SimpleDateFormat;
+import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity implements USIClient.Listener {
@@ -44,6 +52,9 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
 
         bindViews();
         setupClickListeners();
+
+        // Auto-run diagnostics on launch
+        runDiagnostics();
     }
 
     private void bindViews() {
@@ -63,6 +74,111 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
         tvLog = findViewById(R.id.tvLog);
         statusDot = findViewById(R.id.statusDot);
         scrollLog = findViewById(R.id.scrollLog);
+    }
+
+    /**
+     * Dump all network interfaces, USB devices, and attempt a TCP ping
+     * to the default terminal IP. This helps diagnose PCL bridge issues.
+     */
+    private void runDiagnostics() {
+        log("DIAG", "=== Network Interface Scan ===");
+        try {
+            boolean foundUsb = false;
+            for (NetworkInterface iface : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                if (!iface.isUp()) continue;
+                StringBuilder sb = new StringBuilder();
+                sb.append(iface.getName()).append(" (").append(iface.getDisplayName()).append(")");
+                for (InetAddress addr : Collections.list(iface.getInetAddresses())) {
+                    if (addr instanceof Inet4Address) {
+                        sb.append(" → ").append(addr.getHostAddress());
+                    }
+                }
+                String name = iface.getName().toLowerCase();
+                // USB RNDIS/ECM interfaces are typically usb0, rndis0, or eth1+
+                if (name.contains("usb") || name.contains("rndis")) {
+                    sb.append(" [USB ETHERNET]");
+                    foundUsb = true;
+                }
+                log("DIAG", "  " + sb.toString());
+            }
+            if (!foundUsb) {
+                log("DIAG", "  ⚠ No USB Ethernet interface detected!");
+                log("DIAG", "  PCL bridge requires USB host mode (OTG).");
+                log("DIAG", "  Check: Is terminal USB cable connected?");
+                log("DIAG", "  Check: Does tablet support USB OTG?");
+            }
+        } catch (Exception e) {
+            log("DIAG", "  Error scanning interfaces: " + e.getMessage());
+        }
+
+        // Scan USB devices
+        log("DIAG", "=== USB Device Scan ===");
+        try {
+            UsbManager usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
+            HashMap<String, UsbDevice> devices = usbManager.getDeviceList();
+            if (devices.isEmpty()) {
+                log("DIAG", "  No USB devices found");
+            } else {
+                for (UsbDevice device : devices.values()) {
+                    String info = String.format(Locale.US,
+                            "  VID:%04X PID:%04X — %s %s (class:%d)",
+                            device.getVendorId(), device.getProductId(),
+                            device.getManufacturerName() != null ? device.getManufacturerName() : "?",
+                            device.getProductName() != null ? device.getProductName() : "?",
+                            device.getDeviceClass());
+                    log("DIAG", info);
+
+                    // Flag Ingenico devices
+                    int vid = device.getVendorId();
+                    if (vid == 0x1998 || vid == 0x1DD4 || vid == 0x0B00) {
+                        log("DIAG", "  ↑ INGENICO DEVICE DETECTED");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log("DIAG", "  Error scanning USB: " + e.getMessage());
+        }
+
+        // Background TCP reachability test
+        String host = etHost.getText().toString().trim();
+        String portStr = etPort.getText().toString().trim();
+        log("DIAG", "=== TCP Ping " + host + ":" + portStr + " ===");
+
+        new Thread(() -> {
+            try {
+                int port = Integer.parseInt(portStr);
+                long start = System.currentTimeMillis();
+                java.net.Socket sock = new java.net.Socket();
+                sock.connect(new java.net.InetSocketAddress(host, port), 3000);
+                long elapsed = System.currentTimeMillis() - start;
+                sock.close();
+                runOnUiThread(() -> log("DIAG", "  TCP connection OK! (" + elapsed + "ms)"));
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    log("DIAG", "  TCP connection FAILED: " + e.getMessage());
+                    log("DIAG", "  Terminal not reachable at this IP/port.");
+
+                    // Try common alternative IPs
+                    log("DIAG", "  Will scan common PCL bridge IPs...");
+                });
+                // Scan a few common USB bridge IPs
+                String[] tryIps = {"172.16.0.1", "172.16.0.2", "192.168.225.1", "192.168.1.1", "10.0.0.1"};
+                for (String tryIp : tryIps) {
+                    try {
+                        java.net.Socket s = new java.net.Socket();
+                        s.connect(new java.net.InetSocketAddress(tryIp, 50000), 1500);
+                        s.close();
+                        runOnUiThread(() -> {
+                            log("DIAG", "  ✓ FOUND terminal at " + tryIp + ":50000!");
+                            log("DIAG", "  Update the IP field and tap Connect.");
+                            etHost.setText(tryIp);
+                        });
+                        return;
+                    } catch (Exception ignored) {}
+                }
+                runOnUiThread(() -> log("DIAG", "  No terminal found on common IPs."));
+            }
+        }).start();
     }
 
     private void setupClickListeners() {
@@ -182,6 +298,7 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
 
         btnClearLog.setOnClickListener(v -> {
             tvLog.setText("Log cleared.\n");
+            runDiagnostics();
         });
     }
 
@@ -255,10 +372,6 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
         return "unknown";
     }
 
-    /**
-     * Auto-send event_ack for transaction_completed events,
-     * matching the pattern from your production logs.
-     */
     private void autoAckIfNeeded(String json) {
         try {
             JsonObject obj = JsonParser.parseString(json).getAsJsonObject();
