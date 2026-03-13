@@ -2,9 +2,11 @@ package com.worldpay.usitester;
 
 import android.app.AlertDialog;
 import android.content.Context;
+import android.content.Intent;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.text.InputType;
 import android.view.View;
 import android.widget.EditText;
@@ -22,9 +24,11 @@ import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity implements USIClient.Listener {
@@ -57,6 +61,12 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
         runDiagnostics();
     }
 
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Re-scan when returning from tethering settings
+    }
+
     private void bindViews() {
         etHost = findViewById(R.id.etHost);
         etPort = findViewById(R.id.etPort);
@@ -77,107 +87,198 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
     }
 
     /**
-     * Dump all network interfaces, USB devices, and attempt a TCP ping
-     * to the default terminal IP. This helps diagnose PCL bridge issues.
+     * Full diagnostics: network interfaces, USB devices, tethering state,
+     * and terminal scan on USB subnets.
      */
     private void runDiagnostics() {
-        log("DIAG", "=== Network Interface Scan ===");
+        log("DIAG", "========================================");
+        log("DIAG", "  PCL Bridge Diagnostics");
+        log("DIAG", "========================================");
+
+        // ── Step 1: Network interfaces ──
+        log("DIAG", "");
+        log("DIAG", "[1] Network Interfaces:");
+        boolean foundUsbEth = false;
+        String usbGatewayIp = null;
+        String usbSubnet = null;
+
         try {
-            boolean foundUsb = false;
             for (NetworkInterface iface : Collections.list(NetworkInterface.getNetworkInterfaces())) {
                 if (!iface.isUp()) continue;
+
+                String name = iface.getName().toLowerCase();
                 StringBuilder sb = new StringBuilder();
-                sb.append(iface.getName()).append(" (").append(iface.getDisplayName()).append(")");
+                sb.append("  ").append(iface.getName());
+
+                String ipv4 = null;
                 for (InetAddress addr : Collections.list(iface.getInetAddresses())) {
                     if (addr instanceof Inet4Address) {
-                        sb.append(" → ").append(addr.getHostAddress());
+                        ipv4 = addr.getHostAddress();
+                        sb.append(" → ").append(ipv4);
                     }
                 }
-                String name = iface.getName().toLowerCase();
-                // USB RNDIS/ECM interfaces are typically usb0, rndis0, or eth1+
-                if (name.contains("usb") || name.contains("rndis")) {
-                    sb.append(" [USB ETHERNET]");
-                    foundUsb = true;
+
+                // Detect USB tethering interfaces
+                // Android USB tethering: rndis0, usb0, or sometimes eth1
+                // Common tethering subnets: 192.168.42.x, 192.168.48.x
+                boolean isUsbIface = name.contains("usb") || name.contains("rndis")
+                        || (ipv4 != null && (ipv4.startsWith("192.168.42.") || ipv4.startsWith("192.168.48.")));
+
+                if (isUsbIface) {
+                    sb.append(" [USB TETHERING]");
+                    foundUsbEth = true;
+                    if (ipv4 != null) {
+                        usbGatewayIp = ipv4;
+                        // Derive subnet (e.g., 192.168.42)
+                        int lastDot = ipv4.lastIndexOf('.');
+                        usbSubnet = ipv4.substring(0, lastDot);
+                    }
+                } else if (name.contains("wlan") || name.contains("wifi")) {
+                    sb.append(" [WIFI]");
+                } else if (name.equals("lo")) {
+                    continue; // skip loopback
                 }
-                log("DIAG", "  " + sb.toString());
-            }
-            if (!foundUsb) {
-                log("DIAG", "  ⚠ No USB Ethernet interface detected!");
-                log("DIAG", "  PCL bridge requires USB host mode (OTG).");
-                log("DIAG", "  Check: Is terminal USB cable connected?");
-                log("DIAG", "  Check: Does tablet support USB OTG?");
+
+                log("DIAG", sb.toString());
             }
         } catch (Exception e) {
-            log("DIAG", "  Error scanning interfaces: " + e.getMessage());
+            log("DIAG", "  Error: " + e.getMessage());
         }
 
-        // Scan USB devices
-        log("DIAG", "=== USB Device Scan ===");
+        // ── Step 2: USB devices ──
+        log("DIAG", "");
+        log("DIAG", "[2] USB Devices:");
+        boolean foundIngenico = false;
         try {
             UsbManager usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
             HashMap<String, UsbDevice> devices = usbManager.getDeviceList();
             if (devices.isEmpty()) {
-                log("DIAG", "  No USB devices found");
+                log("DIAG", "  (none)");
             } else {
                 for (UsbDevice device : devices.values()) {
                     String info = String.format(Locale.US,
-                            "  VID:%04X PID:%04X — %s %s (class:%d)",
+                            "  VID:%04X PID:%04X %s %s (class:%d)",
                             device.getVendorId(), device.getProductId(),
-                            device.getManufacturerName() != null ? device.getManufacturerName() : "?",
-                            device.getProductName() != null ? device.getProductName() : "?",
+                            device.getManufacturerName() != null ? device.getManufacturerName() : "",
+                            device.getProductName() != null ? device.getProductName() : "",
                             device.getDeviceClass());
                     log("DIAG", info);
 
-                    // Flag Ingenico devices
                     int vid = device.getVendorId();
                     if (vid == 0x1998 || vid == 0x1DD4 || vid == 0x0B00) {
-                        log("DIAG", "  ↑ INGENICO DEVICE DETECTED");
+                        log("DIAG", "    ^ INGENICO TERMINAL");
+                        foundIngenico = true;
                     }
                 }
             }
         } catch (Exception e) {
-            log("DIAG", "  Error scanning USB: " + e.getMessage());
+            log("DIAG", "  Error: " + e.getMessage());
         }
 
-        // Background TCP reachability test
-        String host = etHost.getText().toString().trim();
-        String portStr = etPort.getText().toString().trim();
-        log("DIAG", "=== TCP Ping " + host + ":" + portStr + " ===");
+        // ── Step 3: Status assessment ──
+        log("DIAG", "");
+        log("DIAG", "[3] Status:");
 
+        if (!foundIngenico) {
+            log("DIAG", "  ✗ No Ingenico USB device detected.");
+            log("DIAG", "    → Check USB cable connection.");
+            log("DIAG", "    → Tablet must be USB HOST (use OTG adapter if needed).");
+            log("DIAG", "");
+            return;
+        }
+
+        log("DIAG", "  ✓ Ingenico terminal detected on USB.");
+
+        if (!foundUsbEth) {
+            log("DIAG", "  ✗ No USB Ethernet/tethering interface active.");
+            log("DIAG", "");
+            log("DIAG", "  ══════════════════════════════════════");
+            log("DIAG", "  ACTION REQUIRED: Enable USB Tethering");
+            log("DIAG", "  ══════════════════════════════════════");
+            log("DIAG", "  The Lane 7000 needs the tablet to share");
+            log("DIAG", "  its internet via USB. This creates the");
+            log("DIAG", "  PCL bridge network link.");
+            log("DIAG", "");
+            log("DIAG", "  Go to: Settings → Network/Connections");
+            log("DIAG", "       → Hotspot & Tethering");
+            log("DIAG", "       → USB Tethering → ON");
+            log("DIAG", "");
+            log("DIAG", "  Then tap Clear to re-scan.");
+            log("DIAG", "");
+
+            // Offer to open tethering settings
+            new AlertDialog.Builder(this)
+                    .setTitle("Enable USB Tethering")
+                    .setMessage("Ingenico terminal detected but USB tethering is off.\n\n"
+                            + "USB tethering creates the PCL bridge — it shares the tablet's "
+                            + "internet with the terminal via USB.\n\n"
+                            + "Open tethering settings now?")
+                    .setPositiveButton("Open Settings", (d, w) -> {
+                        try {
+                            // Try tethering settings directly
+                            Intent intent = new Intent(Settings.ACTION_WIRELESS_SETTINGS);
+                            startActivity(intent);
+                        } catch (Exception e) {
+                            // Fallback to general settings
+                            startActivity(new Intent(Settings.ACTION_SETTINGS));
+                        }
+                    })
+                    .setNegativeButton("Later", null)
+                    .show();
+            return;
+        }
+
+        log("DIAG", "  ✓ USB tethering active: " + usbGatewayIp);
+        log("DIAG", "    Tablet is gateway on " + usbSubnet + ".x subnet.");
+
+        // ── Step 4: Scan USB subnet for terminal's WebSocket port ──
+        log("DIAG", "");
+        log("DIAG", "[4] Scanning " + usbSubnet + ".0/24 for port 50000...");
+
+        final String scanSubnet = usbSubnet;
         new Thread(() -> {
-            try {
-                int port = Integer.parseInt(portStr);
-                long start = System.currentTimeMillis();
-                java.net.Socket sock = new java.net.Socket();
-                sock.connect(new java.net.InetSocketAddress(host, port), 3000);
-                long elapsed = System.currentTimeMillis() - start;
-                sock.close();
-                runOnUiThread(() -> log("DIAG", "  TCP connection OK! (" + elapsed + "ms)"));
-            } catch (Exception e) {
-                runOnUiThread(() -> {
-                    log("DIAG", "  TCP connection FAILED: " + e.getMessage());
-                    log("DIAG", "  Terminal not reachable at this IP/port.");
+            String foundIp = null;
 
-                    // Try common alternative IPs
-                    log("DIAG", "  Will scan common PCL bridge IPs...");
-                });
-                // Scan a few common USB bridge IPs
-                String[] tryIps = {"172.16.0.1", "172.16.0.2", "192.168.225.1", "192.168.1.1", "10.0.0.1"};
-                for (String tryIp : tryIps) {
-                    try {
-                        java.net.Socket s = new java.net.Socket();
-                        s.connect(new java.net.InetSocketAddress(tryIp, 50000), 1500);
-                        s.close();
-                        runOnUiThread(() -> {
-                            log("DIAG", "  ✓ FOUND terminal at " + tryIp + ":50000!");
-                            log("DIAG", "  Update the IP field and tap Connect.");
-                            etHost.setText(tryIp);
-                        });
-                        return;
-                    } catch (Exception ignored) {}
-                }
-                runOnUiThread(() -> log("DIAG", "  No terminal found on common IPs."));
+            // Also try the standard PCL bridge IPs
+            List<String> scanIps = new ArrayList<>();
+            // Common terminal IPs on tethering subnets
+            for (int i = 1; i <= 254; i++) {
+                scanIps.add(scanSubnet + "." + i);
             }
+            // Also try standard PCL IPs in case
+            scanIps.add("172.16.0.1");
+            scanIps.add("172.16.0.2");
+
+            for (String ip : scanIps) {
+                try {
+                    java.net.Socket s = new java.net.Socket();
+                    s.connect(new java.net.InetSocketAddress(ip, 50000), 300);
+                    s.close();
+                    foundIp = ip;
+                    break;
+                } catch (Exception ignored) {}
+            }
+
+            final String terminalIp = foundIp;
+            runOnUiThread(() -> {
+                if (terminalIp != null) {
+                    log("DIAG", "  ✓ TERMINAL FOUND at " + terminalIp + ":50000");
+                    log("DIAG", "");
+                    log("DIAG", "  Ready to connect! Tap Connect button.");
+                    etHost.setText(terminalIp);
+                    setStatus("Terminal found", R.drawable.status_dot_yellow);
+                } else {
+                    log("DIAG", "  ✗ No terminal responding on port 50000.");
+                    log("DIAG", "    The terminal may need a moment after");
+                    log("DIAG", "    tethering is enabled. Tap Clear to retry.");
+                    log("DIAG", "");
+                    log("DIAG", "  If this persists, verify in the terminal's");
+                    log("DIAG", "  iConnect-Ws config that:");
+                    log("DIAG", "    mode: 0 (server)");
+                    log("DIAG", "    usb_pcl: 1");
+                    log("DIAG", "    ws_server port: 50000");
+                }
+            });
         }).start();
     }
 
@@ -297,7 +398,7 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
         });
 
         btnClearLog.setOnClickListener(v -> {
-            tvLog.setText("Log cleared.\n");
+            tvLog.setText("");
             runDiagnostics();
         });
     }
@@ -332,11 +433,9 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
         long latency = System.currentTimeMillis() - lastSendTime;
         tvLatency.setText(latency + "ms");
 
-        // Detect message type from the JSON
         String msgType = detectMessageType(json);
         log("RECV [" + msgType + "]", json);
 
-        // Auto-ack transaction_completed events
         autoAckIfNeeded(json);
     }
 
@@ -395,8 +494,6 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
         String ts = sdf.format(new Date());
         String line = "[" + ts + "] " + tag + ": " + message + "\n";
         tvLog.append(line);
-
-        // Auto-scroll to bottom
         scrollLog.post(() -> scrollLog.fullScroll(View.FOCUS_DOWN));
     }
 
