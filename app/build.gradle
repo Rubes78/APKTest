@@ -5,6 +5,7 @@ plugins {
 android {
     namespace 'com.worldpay.usitester'
     compileSdk 34
+    buildToolsVersion "34.0.0"
 
     defaultConfig {
         applicationId "com.worldpay.usitester"

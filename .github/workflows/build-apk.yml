@@ -44,7 +44,16 @@ jobs:
           cat app/build.gradle
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace 2>&1 | tee /tmp/build.log; exit ${PIPESTATUS[0]}
+        run: |
+          ./gradlew assembleDebug --stacktrace 2>&1 | tee /tmp/build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo "=== BUILD FAILED - Last 50 lines ==="
+            tail -50 /tmp/build.log
+            echo "=== FULL ERROR GREP ==="
+            grep -i -A2 "error\|FAILURE\|exception\|Could not" /tmp/build.log | head -40
+          fi
+          exit $BUILD_EXIT
 
       - name: Upload build log on failure
         if: failure()
