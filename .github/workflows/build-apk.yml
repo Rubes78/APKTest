@@ -33,8 +33,25 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
+      - name: Debug environment
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls "$ANDROID_HOME/platforms/" 2>/dev/null || echo "no platforms dir"
+          ls "$ANDROID_HOME/build-tools/" 2>/dev/null || echo "no build-tools dir"
+          java -version
+          cat settings.gradle
+          cat app/build.gradle
+
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --stacktrace
+        run: ./gradlew assembleDebug --stacktrace 2>&1 | tee /tmp/build.log; exit ${PIPESTATUS[0]}
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
 
       - name: Verify APK exists
         run: ls -la app/build/outputs/apk/debug/app-debug.apk
