@@ -221,9 +221,13 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
             log("SYS", "Internet is bridged through tablet WiFi.");
             log("SYS", "");
 
-            // Auto-connect WebSocket after a short delay
-            // (give terminal time to come up on the network)
-            scrollLog.postDelayed(this::autoConnectWebSocket, 3000);
+            log("SYS", "Waiting for terminal to DHCP and come online...");
+            log("SYS", "Watch for DHCP/ARP activity in the log.");
+            log("SYS", "When ready, tap Connect to open WebSocket.");
+            log("SYS", "");
+
+            // Try auto-connecting after giving terminal time for DHCP
+            scrollLog.postDelayed(this::autoConnectWebSocket, 8000);
         } else {
             setStatus("Bridge failed", R.drawable.status_dot_red);
         }
