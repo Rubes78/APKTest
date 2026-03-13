@@ -56,7 +56,22 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
             bridgeService = binder.getService();
             bridgeBound = true;
 
-            bridgeService.setLogListener(msg -> log("BRIDGE", msg));
+            bridgeService.setListener(new PCLBridgeService.Listener() {
+                @Override
+                public void onBridgeLog(String message) {
+                    log("BRIDGE", message);
+                }
+
+                @Override
+                public void onTerminalIpDetected(String ip) {
+                    log("SYS", "*** Terminal IP detected: " + ip + " ***");
+                    etHost.setText(ip);
+                    // Auto-connect WebSocket now that we know the terminal's IP
+                    if (vpnReady && usbReady && !usiClient.isConnected()) {
+                        scrollLog.postDelayed(() -> autoConnectWebSocket(), 2000);
+                    }
+                }
+            });
             bridgeService.setUsbManager(usbManager);
 
             log("SYS", "Bridge service connected");
@@ -85,8 +100,8 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
         bindViews();
         setupClickListeners();
 
-        // Default to the PCL bridge gateway IP
-        etHost.setText(PCLBridgeService.TERMINAL_IP);
+        // Default to gateway IP until terminal IP is detected from frames
+        etHost.setText(PCLBridgeService.GATEWAY_IP);
 
         log("SYS", "========================================");
         log("SYS", "  USI Terminal Tester + PCL Bridge");
@@ -214,20 +229,16 @@ public class MainActivity extends AppCompatActivity implements USIClient.Listene
 
         if (bridgeService.startBridge()) {
             vpnReady = true;
-            setStatus("Bridge active — connecting...", R.drawable.status_dot_yellow);
+            setStatus("Bridge active — waiting for terminal...", R.drawable.status_dot_yellow);
             log("SYS", "");
             log("SYS", "PCL bridge is active!");
-            log("SYS", "Terminal should get IP: " + PCLBridgeService.TERMINAL_IP);
-            log("SYS", "Internet is bridged through tablet WiFi.");
+            log("SYS", "Gateway: " + PCLBridgeService.GATEWAY_IP);
+            log("SYS", "Proxying terminal traffic to internet.");
             log("SYS", "");
-
-            log("SYS", "Waiting for terminal to DHCP and come online...");
-            log("SYS", "Watch for DHCP/ARP activity in the log.");
-            log("SYS", "When ready, tap Connect to open WebSocket.");
+            log("SYS", "Waiting for terminal frames...");
+            log("SYS", "Will detect terminal IP from ARP/IPv4 traffic.");
+            log("SYS", "WebSocket auto-connects when IP is found.");
             log("SYS", "");
-
-            // Try auto-connecting after giving terminal time for DHCP
-            scrollLog.postDelayed(this::autoConnectWebSocket, 8000);
         } else {
             setStatus("Bridge failed", R.drawable.status_dot_red);
         }
