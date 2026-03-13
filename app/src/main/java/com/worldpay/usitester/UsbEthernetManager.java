@@ -18,6 +18,7 @@ import android.os.Looper;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.HashMap;
+import java.util.Locale;
 
 /**
  * Manages USB CDC-ECM/RNDIS communication with the Ingenico Lane 7000.

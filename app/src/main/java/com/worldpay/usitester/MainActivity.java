@@ -21,11 +21,7 @@ import com.google.android.material.textfield.TextInputEditText;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
-import java.net.Inet4Address;
-import java.net.InetAddress;
-import java.net.NetworkInterface;
 import java.text.SimpleDateFormat;
-import java.util.Collections;
 import java.util.Date;
 import java.util.Locale;
 
